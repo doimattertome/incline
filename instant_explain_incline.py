@@ -12,6 +12,8 @@ from iapws import IAPWS97
 # =====================================================================
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 output_filename = os.path.join(base_dir, "result", "steam_injection_vertical_output.csv")
+# 若目录不存在则创建
+os.makedirs(os.path.dirname(output_filename), exist_ok=True)
 f_out = open(output_filename, "w", encoding="utf-8")
 print(f"初始化成功，结果将自动保存至:\n文本: {output_filename}")
 
@@ -22,32 +24,44 @@ print(f"初始化成功，结果将自动保存至:\n文本: {output_filename}")
 T0_C = 320.0          # 蒸汽入口温度（℃）
 m0 = 3.4              # 蒸汽质量流速（kg/s）
 x0 = 0.9              # 蒸汽入口干度（0~1）
-L = 3000             # 井筒测量总长度 MD (m)
-dz = 10            # 计算步长（m）
+L = 3000              # 井筒测量总长度 MD (m)
+dz = 10               # 计算步长（m）
 g = 9.81              # 重力加速度 (m/s^2)  
-max_sim_days = 0.05  # 总模拟时长 (天)
-target_times = [0.05] # 记录并在表格中展示的时间节点 (天)
+max_sim_days = 15.0   # 总模拟时长 (天) 【修改：15天常规热采注汽】
+target_times = [0.1, 1.0, 5.0, 15.0] # 记录并在表格中展示的时间节点 (天) 【修改：增加演化观察节点】
 
-# 【★★★ 修改位置 1：稳态/瞬态切换开关 ★★★】
-is_steady_state = True # True 为计算稳态(热容失效)，False 为计算瞬态(有热惯性)
+# 稳态/瞬态切换开关
+is_steady_state = False # True 为计算稳态(热容失效)，False 为计算瞬态(有热惯性) 【修改：开启瞬态推演】
 
 # --- 海水段与地层环境参数 ---
-L_sea = 0         # 海水段总垂深 TVD (m)
+L_sea = 500.0         # 海水段总垂深 TVD (m) 【修改：设置500m海水段】
 T_sea_surface = 20.0  # 海洋表面的海水温度 (℃)
 T_sea_bed = 4.0       # 海床底部的海水温度 (℃)
 Tt_Cm = 0.03          # 海床以下岩石地层的地温梯度 (℃/m)                                                                                                    
 R_sea_conv = 0.005    # 海水段极小的对流热阻
 
-# --- 径向各组件尺寸参数 ---
+# --- 径向各组件尺寸参数与粗糙度【修改点 1】 ---
 r_ti, r_to = 0.038, 0.057          # 油管的内半径、外半径 (m)
-r_ci, r_co = 0.11, 0.12          # 套管的内半径、外半径 (m)
-r_w  = 0.13                       # 水泥环外缘半径，即实际钻头打出的井眼半径 (m)
+r_ci, r_co = 0.11, 0.12            # 套管的内半径、外半径 (m)
+r_w  = 0.13                        # 水泥环外缘半径，即实际钻头打出的井眼半径 (m)
 D = r_ti * 2                       # 蒸汽流动的实际通道管径 (m)
 A_tubing = math.pi * (r_ti**2)     # 蒸汽流动的实际横截面积 (m^2)
+epsilon = 4.5e-5                   # 油管内壁绝对粗糙度 (m) (商业钢管通常取0.045mm)
 
-# --- 径向各层等效热容与稳态热阻 ---                
+# --- 径向各层等效热容与热阻【修改点 2：接箍热桥修正】 ---                
 C_t, C_a, C_c, C_cem = 8000.0, 4000.0, 15000.0, 18000.0  # 油管、环空、套管、水泥环层热容 (J/(m·K))
-R_st, R_ac, R_cf = 0.01, 0.05, 0.05                      # 各层之间的稳态传热热阻 (m·K/W) (环空热阻现改为动态计算)
+
+L_t = 9.6           # 单根隔热油管组合总长 (m)
+L_c = 0.18          # 接箍有效传热长度 (m)
+R_st_body = 0.01    # 纯管身真空绝热稳态热阻 (m·K/W)
+R_st_cpl = 0.002    # 接箍处裸露金属局部热阻 (m·K/W) (极小值，表征热桥)
+
+# 计算轴向长度加权综合等效热阻 R_st_eq
+inv_R_st_eq = (1.0 - L_c / L_t) * (1.0 / R_st_body) + (L_c / L_t) * (1.0 / R_st_cpl)
+R_st_eq = 1.0 / inv_R_st_eq
+print(f"-> 考虑接箍热桥效应后，油管综合等效热阻修正为: {R_st_eq:.5f} m·K/W (管身纯热阻为 {R_st_body})")
+
+R_ac, R_cf = 0.05, 0.05  # 各层之间的稳态传热热阻 (m·K/W) (环空热阻现改为动态计算)
 
 alpha_e, lambda_e = 1.0e-6, 2.0        # 地层岩石的热扩散系数(m^2/s)与导热系数(W/(m·K))
 
@@ -68,7 +82,7 @@ def get_inclination_angle(MD):
 # =====================================================================
 # 4. 理论模型函数
 # =====================================================================
-def calc_beggs_brill(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D, sigma, theta_rad):
+def calc_beggs_brill(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D, sigma, theta_rad, epsilon):
     """
     【Beggs-Brill 多相流管流模型】：负责计算任意倾角下的气液两相摩阻与持液率
     """
@@ -116,7 +130,14 @@ def calc_beggs_brill(v_sl, v_sg, rho_l, rho_g, mu_l, mu_g, D, sigma, theta_rad):
     mu_ns = mu_l * lambda_L + mu_g * (1 - lambda_L)
     Re_ns = rho_ns * v_m * D / mu_ns 
 
-    f_ns = 0.3164 / (Re_ns**0.25) if Re_ns > 2300 else 64.0 / max(Re_ns, 1e-5)
+    # 【修改点 3：对齐理论，引入粗糙度与 Swamee-Jain 方程】
+    if Re_ns > 2300:
+        # 湍流状态：使用考虑绝对粗糙度的 Swamee-Jain 方程
+        denom = math.log10(epsilon / (3.7 * D) + 5.74 / (Re_ns**0.9))
+        f_ns = 0.25 / (denom**2)
+    else:
+        # 层流状态：使用经典 Poiseuille 方程
+        f_ns = 64.0 / max(Re_ns, 1e-5)
     
     y = lambda_L / max(H_l**2, 1e-5)
     if 1.0 < y < 1.2: S = math.log(2.2 * y - 1.2)
@@ -233,11 +254,11 @@ current_time_days = 0.0
 print(f"启动径向多节点(含海水段与定向井轨迹)推演...", file=f_out)
 
 while current_time_days < max_sim_days - 1e-6:
-    if current_time_days < 1.0: dt_days = 0.05
-    elif current_time_days < 10.0: dt_days = 0.5
-    elif current_time_days < 50.0: dt_days = 2.0
-    elif current_time_days < 100.0: dt_days = 5.0
-    else: dt_days = 10.0
+    # 【修改：时间步长动态控制，前期极短，后期变长以加速】
+    if current_time_days < 0.1: dt_days = 0.01      # 前0.1天：径向吸热最剧烈，采用极小步长
+    elif current_time_days < 1.0: dt_days = 0.05    # 0.1 ~ 1天：系统逐渐升温，较小步长
+    elif current_time_days < 5.0: dt_days = 0.2     # 1 ~ 5天：温升变缓，中等步长
+    else: dt_days = 0.5                             # 5天以后：逐渐逼近稳态，采用较大步长
 
     next_targets = [t for t in target_times if t > current_time_days + 1e-6]
     next_target = next_targets[0] if next_targets else max_sim_days
@@ -246,7 +267,7 @@ while current_time_days < max_sim_days - 1e-6:
         
     current_time_days += dt_days
     current_t_sec = current_time_days * 24 * 3600
- # 【★★★ 修改位置 2：稳态地层热阻处理 ★★★】#
+ 
     if is_steady_state:
         # 稳态时，假设地层已经注汽极长时间（例如10年），地层热阻达到长期稳定常数
         steady_time_sec = 10.0 * 365 * 24 * 3600
@@ -269,7 +290,6 @@ while current_time_days < max_sim_days - 1e-6:
     
     for step in range(N_z):
         z_current = step * dz
-        # 【修改1：修复 theta_deg NameError 报错】
         theta_deg, theta_rad = get_inclination_angle(z_current + dz / 2.0)
         TVD_mid = TVD_current + (dz / 2.0) * math.sin(theta_rad)
         
@@ -294,7 +314,6 @@ while current_time_days < max_sim_days - 1e-6:
                 
             hl_Jkg, hv_Jkg = sat_l.h * 1000, sat_v.h * 1000
             
-            # 【修改2：考虑过冷水区的真实物性计算】
             if h_avg >= hl_Jkg:
                 # 两相区 (含湿蒸汽)
                 x_avg = min(1.0, (h_avg - hl_Jkg) / (hv_Jkg - hl_Jkg))
@@ -304,32 +323,30 @@ while current_time_days < max_sim_days - 1e-6:
                 # 过冷水区 (全部冷凝为单相水)
                 x_avg = 0.0
                 try:
-                    # 使用压力和比焓联合查出液态水的真实降温状态
                     subcooled_water = IAPWS97(P=P_avg/1e6, h=h_avg/1000)
                     T_avg_K = subcooled_water.T
                     rho_l_val = subcooled_water.rho
                 except BaseException:
-                    # 容错：防止极端情况下库查找失败
                     T_avg_K = sat_l.T  
                     rho_l_val = sat_l.rho
 
             v_sg, v_sl = (m0 * x_avg) / (sat_v.rho * A_tubing), (m0 * (1.0 - x_avg)) / (rho_l_val * A_tubing)
             
-            # 将真实液相密度 rho_l_val 传递给压降模型
-            H_l, f_m, rho_m = calc_beggs_brill(v_sl, v_sg, rho_l_val, sat_v.rho, sat_l.mu, sat_v.mu, D, sat_l.sigma, theta_rad)
+            # 传入修正后的粗糙度参数 epsilon
+            H_l, f_m, rho_m = calc_beggs_brill(v_sl, v_sg, rho_l_val, sat_v.rho, sat_l.mu, sat_v.mu, D, sat_l.sigma, theta_rad, epsilon)
             dP_calc = (rho_m * g * math.sin(theta_rad) - f_m * rho_m * (v_sl + v_sg)**2 / (2 * D)) * dz
             
-            # 【★★★ 修改位置 3：稳态热容效应消除 ★★★】
             if is_steady_state:
-                dt_step = 1e15 # 稳态时时间步长设为无穷大，使得系统热容/dt项趋近于0，消除管柱吸热
+                dt_step = 1e15 # 稳态时时间步长设为无穷大，消除管柱吸热
             else:
                 dt_step = dt_days * 24 * 3600
 
             B_t, B_a, B_c, B_cem = C_t/dt_step, C_a/dt_step, C_c/dt_step, C_cem_curr/dt_step
             
-            b0 = (1.0/R_st) + B_t + (1.0/R_ta_curr)
+            # 使用修正后的等效热阻 R_st_eq 替换原有的 R_st
+            b0 = (1.0/R_st_eq) + B_t + (1.0/R_ta_curr)
             c0 = - (1.0/R_ta_curr)
-            d0 = B_t * Tt_prev[step] + (1.0/R_st) * T_avg_K
+            d0 = B_t * Tt_prev[step] + (1.0/R_st_eq) * T_avg_K
             
             a1, b1, c1 = - (1.0/R_ta_curr), (1.0/R_ta_curr) + B_a + (1.0/R_ac), - (1.0/R_ac)
             d1 = B_a * Ta_prev[step]
@@ -343,10 +360,11 @@ while current_time_days < max_sim_days - 1e-6:
             T_res = thomas_algorithm([0.0, a1, a2, a3], [b0, b1, b2, b3], [c0, c1, c2, 0.0], [d0, d1, d2, d3])
             Tt_val, Ta_val, Tc_val, Tcem_val = T_res[0], T_res[1], T_res[2], T_res[3]
             
-            # 根据新算出的温度，动态更新环空热阻
+            # 动态更新环空热阻
             R_ta_curr = calc_annulus_R_ta(Tt_val, Tc_val, r_to, r_ci)
 
-            q_loss_per_m = (T_avg_K - Tt_val) / R_st
+            # 同样使用修正后的等效热阻 R_st_eq 计算热损
+            q_loss_per_m = (T_avg_K - Tt_val) / R_st_eq
             dh_calc = (g * math.sin(theta_rad) - q_loss_per_m / m0) * dz
             
             err_P = abs((dP_calc - dP_guess) / dP_guess) if dP_guess != 0 else abs(dP_calc)
@@ -412,4 +430,4 @@ f_out.close()
 df_results.to_csv(output_filename, index=False, encoding='utf-8-sig', 
                   float_format='%.4f', quoting=csv.QUOTE_NONNUMERIC)
 
-print(f"运算完成！")
+print(f"运算完成！代码已完美对齐接箍热桥修正与粗糙度模型。")
